@@ -1,0 +1,148 @@
+---
+title: "Practicum"
+output: html_document
+---
+
+```{r}
+library(RMySQL)
+
+dbcon <- dbConnect(RMySQL::MySQL(), user='newuser', password = 'test',
+                   dbname = 'practicum_test', host = 'localhost')
+
+```
+
+
+```{r}
+dbWriteTable(dbcon, "CREATE TABLE test (number int, name varchar(255));")
+```
+
+```{r}
+dbSendQuery(dbcon, "CREATE TABLE test (number int, name varchar(255));")
+```
+```{sql connection=dbcon}
+INSERT INTO test (number, name)
+VALUES (1, "John");
+```
+
+```{sql connection=dbcon}
+SELECT * FROM test;
+```
+
+
+```{r}
+dbSendQuery(dbcon, "DROP TABLE test;")
+```
+```{r}
+rm(wildlife)
+wildlife <- 0
+wildlife$species <- birdStrikesData$wildlife_species
+wildlife <- data.frame(wildlife)
+wildlife <- subset(wildlife, select=-c(X0))
+
+
+wildlife$wildlife_size <- birdStrikesData$wildlife_size
+
+```
+
+```{r}
+options(sqldf.driver = "SQLite")
+
+wildlife <- sqldf("select DISTINCT species, wildlife_size
+      from wildlife")
+sqldf("SELECT * FROM wildlife GROUP BY species having 1 <> COUNT((species))")
+
+
+options(sqldf.driver = "RMySQL")
+
+```
+
+
+```{r}
+rm(flight)
+flight <- 0
+flight$airline_or_operator <- birdStrikesData$airline_or_operator
+flight$airport_name <- birdStrikesData$airport_name
+flight$origin_state <- birdStrikesData$origin_state 
+flight$flight_date <- birdStrikesData$flight_date
+flight <- data.frame(flight)
+flight <- subset(flight, select=-c(X0))
+
+```
+
+
+```{r}
+options(sqldf.driver = "SQLite")
+
+flight <- sqldf("SELECT DISTINCT airline_or_operator, airport_name, origin_state, aircraft_id, flight_date FROM flight")
+options(sqldf.driver = "RMySQL")
+```
+
+
+
+merge code
+```{r}
+test <- merge(birdStrikesData, aircraft, by = "aircraft_model")
+#test <- test[!duplicated(as.list(test))]
+test$number_of_engines.y <- NULL
+test$is_aircraft_large.y <- NULL
+test$aircraft_type.y <- NULL
+
+names(test)[names(test) == "number_of_engines.x"] <- "number_of_engines"
+names(test)[names(test) == "aircraft_type.x"] <- "aircraft_type"
+names(test)[names(test) == "is_aircraft_large.x"] <- "is_aircraft_large"
+
+```
+
+Testing using sqldf to merge.
+```{r}
+options(sqldf.driver = "SQLite")
+
+test2 <- sqldf("SELECT * FROM test, flight 
+              WHERE test.airline_or_operator = flight.airline_or_operator
+              AND test.airport_name = flight.airport_name
+              AND test.origin_state = flight.origin_state
+              AND test.aircraft_id = flight.aircraft_id
+              AND test.flight_date = flight.flight_date;")
+test2 <- test2[!duplicated(as.list(test2))]
+options(sqldf.driver = "RMySQL")
+
+```
+
+Test that q5 is correct.
+```{r}
+options(sqldf.driver = "SQLite")
+
+sqldf("SELECT airline_or_operator, count(record_id) FROM birdStrikesData
+      WHERE phase_of_flight = 'Climb' OR
+      phase_of_flight = 'Take-off run' 
+      GROUP BY (airline_or_operator)
+      ORDER BY (airline_or_operator)" )
+options(sqldf.driver = "RMySQL")
+```
+
+## Q5 Verification
+Verifies the result by looking at all number of strikes ordered by number of strikes descending.
+```{sql connection=dbcon}
+SELECT airport_name, count(record_id) as num_strikes FROM practicum.bird_strike as bird_strike
+INNER JOIN practicum.flight as flight on flight.flight_id = bird_strike.flight_id
+GROUP BY (airport_name)
+ORDER BY(num_strikes) DESC;
+```
+
+
+```{r}
+flight$flight_id <- seq.int(nrow(flight))
+
+
+#test <- test[!duplicated(as.list(test))]
+#test2 <- merge(test, flight) 
+```
+
+
+```{r}
+dbDisconnect(dbcon)
+```
+
+
+
+

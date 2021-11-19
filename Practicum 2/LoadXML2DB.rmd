@@ -1,0 +1,404 @@
+---
+title: "Parse XML to Relational Model"
+author: "Martin Schedlbauer, PhD"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+This example shows how to load and parse an XML document into an internal relational model of data frames. It traverses the DOM tree node-by-node and then save the data into data frames. The data frames are eventually written to a new database. The example uses only Base R and does not use **tidyverse** which has additional support for managing relational structures.
+
+We start by loading the required libraries.
+
+```{r loadLibraries}
+library(XML)
+
+library(RSQLite)
+library(DBI)
+library(knitr)
+```
+
+This section sets up the file names and paths; this needs to be adjusted as needed.
+
+```{r filenames}
+path <- "/Users/mschedlb/Downloads/"
+fn <- "purchaseorders.xml"
+fpn = paste0(path, fn)
+dbfn <- "podb.db"
+dbfpn = paste0(path, dbfn)
+```
+
+## Load XML into Document Object Model (DOM)
+
+Start by parsing the XML file and loading it into an internal tree structure in memory. Note that the parsing is not validating as there is no DTD in the provided XML.
+
+```{r}
+# Reading the XML file and parse into DOM
+xmlDOM <- xmlParse(file = fpn)
+
+# get the root node of the DOM tree
+r <- xmlRoot(xmlDOM)
+```
+
+## ERD for PurchaseOrder XML
+
+Before parsing the XML further we need to define the structure of the relational model. The in-memory structure in the dataframes will match the database structures and tables.
+
+[ERD Diagram for PurchaseOrder XML (not fully normalized)](CS5200.SlideDecks/ERD4PurchaseOrderXML.jpg)
+
+Note that the model is not fully normalized. For example, there should be a separate **ZipCodes** table with columns _zip_, _city_, _state_, _country_ and the **Address** table should only contain _zip_.
+
+## Parse into a Data Frame
+
+Load the data into vectors and then merge into a data frame. Use attributes as PKs. The parsing and processing strategy used here only works when the elements are in a deterministic order and the order or cardinality does not change. Since there is no DTD or XML Schema it is not assured that the elements always appear in the expected order. The order is ascertained through inspection and depends on the XML provided and since it may change in the future this parsing code could "break".
+
+### Create Internal Data Frames
+
+The dataframes mimic the relational structure of the database. This only works when the data fits into memory. Otherwise, if the data is too large then the data should be parsed and written to the tables in the databases as it is retrieved. If the XML is really large then a SAX parsing approach should be used.
+
+```{r createDFs}
+# get number of children of root (number of purchase orders)
+numPO <- xmlSize(r)
+
+# create various data frames to hold data; initial values are just
+# to define data type and length and will be replaced; pre-allocation
+# is better for performance than dynamic allocation of memory
+PO.df <- data.frame (POnum = vector (mode = "integer", 
+                                     length = numPO),
+                     orderDate = vector (mode = "character", 
+                                         length = numPO),
+                     billing = vector (mode = "integer", 
+                                       length = numPO),
+                     shipping = vector (mode = "integer", 
+                                        length = numPO),
+                     delNotes = vector (mode = "character", 
+                                        length = numPO),
+                     stringsAsFactors = F)
+
+# we actually do not know the number of addresses so we cannot
+# pre-allocate the memory
+Address.df <- data.frame (aID = integer(),
+                          name = character(),
+                          street = character(),
+                          city = character(),
+                          state = character(),
+                          zip = character(),
+                          country = character(),
+                          stringsAsFactors = F)
+
+Item.df <- data.frame (PartNumber = character(),
+                       ProductName = character(),
+                       Quantity = integer(),
+                       USPrice = numeric(),
+                       Comment = character(),
+                       ShipDate = character(),
+                       POnum = integer(),
+                       stringsAsFactors = F)
+```
+
+### Support Functions
+
+The functions below are support functions used later in the code.
+
+#### parseAddress
+
+Parses the address XML node in _anAddressNode_ and returns it in a one row data frame.
+
+The address XML is presumed to look like this. The _Type_ attribute is ignored.
+
+```{xml}
+<Address Type="Shipping">
+  <Name>Ellen Adams</Name>
+  <Street>123 Maple Street</Street>
+  <City>Mill Valley</City>
+  <State>CA</State>
+  <Zip>10999</Zip>
+  <Country>USA</Country>
+</Address>
+```
+
+```{r parseAddress}
+parseAddress <- function (anAddressNode)
+{
+  # parse the address into its components
+  name <- xmlValue(anAddressNode[[1]])
+  street <- xmlValue(anAddressNode[[2]])
+  city <- xmlValue(anAddressNode[[3]])
+  state <- xmlValue(anAddressNode[[4]])
+  zip <- xmlValue(anAddressNode[[5]])
+  country <- xmlValue(anAddressNode[[6]])
+  
+  newAddr.df <- data.frame(name, street, city, state, 
+                           zip, country, 
+                           stringsAsFactors = F)
+  
+  return(newAddr.df)
+}
+```
+
+#### Function: parseItems
+
+Get a node of <items> with <item> children underneath and then parse them into a dataframe and return the items. Note that <Item> has three children that are always assumed to be present in that order: <ProductName>, <Quantity>, and <USPrice>, but then may have two additional children: <Comment> or <ShipDate>. It appears from the XML file provided that both cannot occur -- but this may not be true.
+
+```{r parseItems}
+parseItems <- function (anItemsNode)
+{
+  newItems.df <- data.frame(prodName = character(),
+                            qty = integer(),
+                            USPrice = numeric(),
+                            comment = character(),
+                            shipDate = character(),
+                            stringsAsFactors = F)
+  n <- xmlSize(anItemsNode)
+  
+  # extract each of the <Item> nodes under <Items>
+  for (m in 1:n)
+  {
+    anItem <- anItemsNode[[m]]
+    # extract first child nodes that are always present 
+    prodName <- xmlValue(anItem[[1]])
+    qty <- xmlValue(anItem[[2]])
+    price <- xmlValue(anItem[[3]])
+    comment <- xpathSApply(anItem, "./Comment", xmlValue)
+    if (length(comment) == 0)
+      comment <- ""
+    shipdate <- xpathSApply(anItem, "./ShipDate", xmlValue)
+    if (length(shipdate) == 0)
+      shipdate <- ""
+
+    newItems.df[m,1] <- prodName
+    newItems.df[m,2] <- qty
+    newItems.df[m,3] <- price
+    newItems.df[m,4] <- comment
+    newItems.df[m,5] <- shipdate
+  }
+  
+  return(newItems.df)
+}
+```
+
+#### Function: rowExists
+
+Checks if it already exists in the passed data frame. Returns a key to the item if it exists, 0 otherwise. The columns in the row _aRow_ are expected to be in the same order as the columns in the data frame _aDF_.
+
+```{r rowExists}
+rowExists <- function (aRow, aDF)
+{
+  # check if that address is already in the data frame
+  n <- nrow(aDF)
+  c <- ncol(aDF)
+  
+  if (n == 0)
+  {
+    # data frame is empty, so can't exist
+    return(0)
+  }
+  
+  for (a in 1:n)
+  {
+    # check if all columns match for a row; ignore the aID column
+    if (all(aDF[a,] == aRow[1,]))
+    {
+      # found a match; return it's ID
+      return(a)
+    }
+  }
+  
+  # none matched
+  return(0)
+}
+```
+
+### Iterate over Purchase Orders
+
+Process the XML by individually looking at each purchase order and from there save off the addresses and items -- after ensuring that they are not duplicates. The code contains specific comments as to its working, choice of approach, and use of functions.
+
+```{r process POs}
+
+# Reading the XML file and parse into DOM
+xmlDOM <- xmlParse(file = fpn)
+
+# get the root node of the DOM tree
+r <- xmlRoot(xmlDOM)
+
+numPO <- xmlSize(r)
+
+# iterate over the first-level child elements off the root:
+# the <PurchaseOrder> elements
+
+for (i in 1:numPO)
+{
+  # get next purchase order node
+  aPO <- r[[i]]
+  
+  # get the purchase number order date attributes
+  # <PurchaseOrder PurchaseOrderNumber="903" OrderDate="2020-10-20">
+  a <- xmlAttrs(aPO)
+  
+  # we assume that the purchase order is a number but we really
+  # should first check if PONum starts with a character
+  poNum <- as.numeric(a[1])
+  
+  # order date is left as a string/text but can (and should be)
+  # converted to a Date object
+  orderDate <- a[2]
+  
+  # add them to the purchase order data frame
+  PO.df$orderDate[i] <- orderDate
+  PO.df$POnum[i] <- poNum
+  
+  # <DeliveryNotes> is optional, so skip if not present
+  items <- aPO[[3]]
+  
+  if (xmlName(items) == "DeliveryNotes")
+  {
+    # save the delivery notes
+    PO.df$delNotes[i] <- xmlValue(items)
+    
+    # items is now the fourth child and not the third and
+    # delivery notes remains empty as it's not in the XML
+    items <- aPO[[4]]
+  }
+  
+  # process both addresses -- duplicates are possible
+  # assumes that first address is always "Shipping" and
+  # second address is always "Billing" and that both are
+  # present in the XML as the first two child nodes of
+  # <PurchaseOrder>
+  
+  # parse shipping address
+  shipping <- parseAddress(aPO[[1]])
+  # check if address already exists
+  pk.Addr <- rowExists(shipping, Address.df[,2:ncol(Address.df)])
+  
+  if (pk.Addr == 0)
+  {
+    # does not exist, so add
+    pk.Addr <- nrow(Address.df) + 1
+    Address.df[pk.Addr,2:ncol(Address.df)] <- shipping[1,]
+    Address.df[pk.Addr,1] <- pk.Addr
+  }
+  
+  # set FK in PO to the shipping address
+  PO.df$shipping[i] <- pk.Addr
+  
+  # parse billing address
+  billing <- parseAddress(aPO[[2]])
+  # check if address already exists
+  pk.Addr <- rowExists(billing, Address.df[,2:ncol(Address.df)])
+  
+  if (pk.Addr == 0)
+  {
+    # does not exist, so add
+    pk.Addr <- nrow(Address.df) + 1
+    Address.df[pk.Addr,2:ncol(Address.df)] <- billing[1,]
+    Address.df[pk.Addr,1] <- pk.Addr
+  }
+  
+  # set FK in PO to the billing address
+  PO.df$billing[i] <- pk.Addr
+  
+  # process the set of items into a separate data frame
+  poItems <- parseItems(items)
+  
+  # always add them regardless of duplicates
+  
+  for (n in 1:nrow(poItems))
+  {
+    # set PK using PartNumber attribute in <item> 
+    pk.Item <- xmlAttrs(items[[n]])[1]
+    
+    # append them to the data frame
+    j <- nrow(Item.df)+1
+    Item.df[j,2:(ncol(Item.df)-1)] <- poItems[n,]
+    Item.df[j,1] <- pk.Item
+    
+    # set FK to PO -- last column
+    Item.df[j,ncol(Item.df)] <- poNum
+  }
+  
+}
+
+```
+
+## Save Data Frame to SQL Database
+
+### Create Connection to Database
+
+```{r setup database, include=FALSE}
+
+PODBcon <- dbConnect(RSQLite::SQLite(), dbfpn)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# set connection object for subsequent SQL chunks
+knitr::opts_chunk$set(connection = "PODBcon")
+```
+
+### Write Data to Database
+
+Write the data frames to new tables. The tables are automatically created from the structure of the data frames. However, a drawback when automatically creating tables is that there are specified referential integrity constraints. So, the **addresses** and **po** tables are automatically created while the **items** table for Items is explicitly created with foreign key constraints.
+
+#### Create Tables
+
+While all tables should be created using <code>CREATE TABLE</code>, only the table for items is created that way for now; the others are created automatically by <code>dbWriteTable</code> below.
+
+Drop (delete) the table for the items. The other tables are overwritten automatically by <code>dbWriteTable</code> below. In order to ensure that the foreign keys exist for the shipping and billing addresses, those must be inserted first. The purchase order table is created next as it references the addresses, while the items table is created last as it references purchase orders.
+
+```{sql drop tables, connection = "PODBcon"}
+drop table if exists items;
+```
+
+The **items** table for purchase orders must have the columns in the same sequence with the same data types as in the _Item.df_ data frame.
+
+Item.df <- data.frame (PartNumber = character(),
+                       ProductName = character(),
+                       Quantity = integer(),
+                       USPrice = numeric(),
+                       Comment = character(),
+                       ShipDate = character(),
+                       POnum = integer(),
+                       stringsAsFactors = F)
+
+```{sql create items table,connection = "PODBcon"}
+create table items (
+  pnum text,
+  prodname text,
+  qty integer,
+  price number,
+  comment text,
+  shipdate text,
+  ponum integer,
+  primary key (pnum),
+  foreign key (ponum) references po(POnum)
+);
+```
+
+#### Write Data
+
+```{r}
+dbWriteTable(PODBcon, "addresses", Address.df, overwrite = T)
+dbWriteTable(PODBcon, "items", Item.df, overwrite = T)
+dbWriteTable(PODBcon, "po", PO.df, overwrite = T)
+```
+
+To ensure that the data was written properly, let's retreive some of the rows.
+```{sql connection = "PODBcon", output.var = "authorDF"}
+select * from addresses limit 5;
+```
+
+```{sql connection = "PODBcon"}
+select * from items limit 5;
+```
+
+```{sql connection = "PODBcon"}
+select * from po limit 5;
+```
+
+#### Disconnect Database
+
+```{r disconnect DB}
+dbDisconnect(PODBcon)
+```
